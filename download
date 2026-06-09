@@ -1,0 +1,80 @@
+"""
+synthetic_prices.py
+===================
+Realistic synthetic NEM price series covering the full ANZ market structure, so
+the repo runs end-to-end without an AEMO download. Replace with real data via
+fetch_aemo_data.py.
+
+Generates 5-minute prices for:
+  RRP              energy regional reference price (AUD/MWh)
+  R6SEC..R1SEC     four contingency-RAISE FCAS prices (AUD/MW)
+  L6SEC..L1SEC     four contingency-LOWER FCAS prices (AUD/MW)
+  RAISEREG/LOWERREG  two regulation FCAS prices (AUD/MW)
+
+This is the real NEM structure: 10 FCAS markets (8 contingency + 2 regulation).
+R1SEC / L1SEC are the "Very Fast" (1-second) services live since Oct 2023.
+Prices mimic QLD1 duck-curve dynamics with correlated FCAS spikes during stress.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+RAISE = ["R6SEC", "R60SEC", "R5MIN", "R1SEC"]
+LOWER = ["L6SEC", "L60SEC", "L5MIN", "L1SEC"]
+
+
+def generate(days: int = 31, seed: int = 7, region: str = "QLD1") -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    ipd = 288
+    n = days * ipd
+    ts = pd.date_range("2024-01-01", periods=n, freq="5min")
+    hour = ts.hour + ts.minute / 60.0
+
+    # --- energy price: duck curve ---
+    base = 60.0
+    solar_trough = -45 * np.exp(-((hour - 12.5) ** 2) / (2 * 2.2 ** 2))
+    evening_peak = 95 * np.exp(-((hour - 18.5) ** 2) / (2 * 1.4 ** 2))
+    morning = 20 * np.exp(-((hour - 7.5) ** 2) / (2 * 1.5 ** 2))
+    rrp = base + solar_trough + evening_peak + morning
+    day_idx = np.arange(n) // ipd
+    rrp = rrp * (1 + 0.22 * rng.standard_normal(days)[day_idx])
+    rrp = rrp + rng.normal(0, 8, n)
+
+    # stress events drive both energy spikes AND FCAS spikes (correlated)
+    stress = (rng.random(n) < 0.004) & (hour > 16) & (hour < 20)
+    rrp = rrp + stress * rng.uniform(300, 1100, n)
+    # negative-price midday events (solar flood)
+    neg = (rng.random(n) < 0.05) & (hour > 9) & (hour < 15)
+    rrp = rrp - neg * rng.uniform(50, 250, n)
+    rrp = np.clip(rrp, -1000, 16600)  # NEM price floor/cap
+
+    df = {"SETTLEMENTDATE": ts, "REGIONID": region, "RRP": rrp.round(2)}
+
+    # --- contingency FCAS prices (AUD/MW): low, with stress spikes ---
+    # faster services (6s, 1s) tend to price higher than slower (5min)
+    speed_premium = {"R6SEC": 1.0, "R60SEC": 0.7, "R5MIN": 0.5, "R1SEC": 1.4,
+                     "L6SEC": 0.9, "L60SEC": 0.6, "L5MIN": 0.45, "L1SEC": 1.2}
+    for svc in RAISE + LOWER:
+        prem = speed_premium[svc]
+        p = np.abs(rng.gamma(1.4, 0.7, n)) * prem + 0.3
+        p = p + stress * rng.uniform(8, 60, n) * prem      # contingency spikes on stress
+        df[svc] = p.round(2)
+
+    # --- regulation FCAS (continuous, AUD/MW) ---
+    df["RAISEREG"] = (np.abs(rng.gamma(1.6, 1.2, n)) + 0.5 + stress * rng.uniform(10, 40, n)).round(2)
+    df["LOWERREG"] = (np.abs(rng.gamma(1.5, 1.0, n)) + 0.4).round(2)
+
+    return pd.DataFrame(df)
+
+
+if __name__ == "__main__":
+    df = generate()
+    out = os.path.join(DATA_DIR, "nem_prices_synthetic.csv")
+    df.to_csv(out, index=False)
+    print(f"Saved {len(df):,} intervals -> {out}")
+    cols = ["RRP"] + RAISE + LOWER + ["RAISEREG", "LOWERREG"]
+    print(df[cols].describe().round(1).T[["mean", "min", "max"]].to_string())

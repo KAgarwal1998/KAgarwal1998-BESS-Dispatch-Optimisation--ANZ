@@ -1,0 +1,133 @@
+"""
+run.py
+======
+Runs the multi-market co-optimisation across a NEM price series and applies the
+Australian CIS (Capacity Investment Scheme) cap-and-floor revenue contract.
+
+CIS cap-and-floor (the headline ANZ revenue-certainty mechanism):
+  - If merchant revenue falls BELOW the floor, the government tops it up to the
+    floor (downside protection).
+  - If merchant revenue rises ABOVE the ceiling, the project keeps part and pays
+    back a share (here 50%) to the government (upside sharing).
+  This is exactly why ANZ battery investment de-risked post-2024.
+
+Also decomposes revenue by market and compares scenarios:
+  - energy only
+  - energy + contingency FCAS
+  - energy + contingency + regulation (full stack)
+  - with/without Very Fast (R1/L1) services
+"""
+
+import os, sys
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.dirname(__file__))
+from optimiser import Battery, optimise_day, RAISE, LOWER
+
+PRICE_COLS = ["RRP"] + RAISE + LOWER + ["RAISEREG", "LOWERREG"]
+
+
+def load_prices() -> pd.DataFrame:
+    data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
+    real = os.path.join(data_dir, "nem_prices.csv")
+    synth = os.path.join(data_dir, "nem_prices_synthetic.csv")
+    if os.path.exists(real):
+        print("Using REAL AEMO data.")
+        path = real
+    else:
+        print("Real data not found - using SYNTHETIC prices (run fetch_aemo_data.py for real).")
+        if not os.path.exists(synth):
+            from synthetic_prices import generate
+            generate().to_csv(synth, index=False)
+        path = synth
+    df = pd.read_csv(path, parse_dates=["SETTLEMENTDATE"])
+    for c in PRICE_COLS:
+        if c not in df.columns:
+            df[c] = 0.0
+    return df
+
+
+def run_dispatch(df, batt, enable_fcas=True, enable_reg=True, enable_vf=True):
+    df = df.copy()
+    df["date"] = df["SETTLEMENTDATE"].dt.date
+    dt_h = 5 / 60
+    daily, chg_all, dis_all = [], [], []
+    for _, day in df.groupby("date"):
+        prices = {c: day[c].values for c in PRICE_COLS}
+        out = optimise_day(prices, batt, dt_h, enable_fcas, enable_reg, enable_vf)
+        if not out["ok"]:
+            continue
+        daily.append({"date": day["date"].iloc[0], "energy": out["energy_rev"],
+                      "contingency": out["contingency_rev"], "regulation": out["regulation_rev"],
+                      "cycle_cost": out["cycle_cost"], "total": out["total"], **out["svc_rev"]})
+        chg_all.append(out["chg"]); dis_all.append(out["dis"])
+    d = pd.DataFrame(daily)
+    n_days = len(d)
+    annual = d["total"].sum() / n_days * 365
+    res = {
+        "daily": d, "n_days": n_days,
+        "annual_total": annual,
+        "annual_energy": d["energy"].sum() / n_days * 365,
+        "annual_contingency": d["contingency"].sum() / n_days * 365,
+        "annual_regulation": d["regulation"].sum() / n_days * 365,
+        "per_mw": annual / batt.power_mw,
+    }
+    if chg_all:
+        df["chg"] = np.concatenate(chg_all); df["dis"] = np.concatenate(dis_all)
+        res["df"] = df
+    return res
+
+
+def apply_cis(annual_per_mw, floor, ceiling, clawback):
+    """Apply CIS cap-and-floor to a merchant per-MW revenue."""
+    if annual_per_mw < floor:
+        return floor, "floor top-up"
+    if annual_per_mw > ceiling:
+        kept = ceiling + (annual_per_mw - ceiling) * (1 - clawback)
+        return kept, "ceiling clawback"
+    return annual_per_mw, "within band"
+
+
+if __name__ == "__main__":
+    import json
+    cfg = json.load(open(os.path.join(os.path.dirname(__file__), "..", "inputs", "base.json")))
+    b = cfg["battery"]
+    batt = Battery(power_mw=b["power_mw"], duration_h=b["duration_h"], rte=b["rte"],
+                   cycle_cost_per_mwh=b["cycle_cost_per_mwh"],
+                   soc_min_frac=b["soc_min_frac"], soc_max_frac=b["soc_max_frac"],
+                   reg_utilisation=cfg["fcas"]["regulation_utilisation"])
+    df = load_prices()
+
+    full = run_dispatch(df, batt, True, True, True)
+    no_vf = run_dispatch(df, batt, True, True, False)
+    cont_only = run_dispatch(df, batt, True, False, True)
+    energy_only = run_dispatch(df, batt, False, False, True)
+
+    c = cfg["contract"]
+    merchant_pmw = full["per_mw"]
+    contracted_pmw, status = apply_cis(merchant_pmw, c["revenue_floor_per_mw_yr"],
+                                       c["revenue_ceiling_per_mw_yr"], c["ceiling_clawback_frac"])
+
+    print("=" * 66)
+    print(f"ANZ BESS MULTI-MARKET DISPATCH — {batt.power_mw:.0f} MW / {batt.energy_mwh:.0f} MWh")
+    print("=" * 66)
+    print(f"Days modelled: {full['n_days']}  |  region {cfg['_meta']['region']}")
+    print("-" * 66)
+    print(f"Full stack (energy+contingency+regulation): AUD {full['annual_total']/1e6:6.2f} m/yr  (AUD {full['per_mw']:,.0f}/MW)")
+    print(f"   energy arbitrage : AUD {full['annual_energy']/1e6:6.2f} m/yr")
+    print(f"   contingency FCAS : AUD {full['annual_contingency']/1e6:6.2f} m/yr")
+    print(f"   regulation FCAS  : AUD {full['annual_regulation']/1e6:6.2f} m/yr")
+    print("-" * 66)
+    print(f"Energy only                : AUD {energy_only['per_mw']:>9,.0f}/MW")
+    print(f"+ contingency FCAS         : AUD {cont_only['per_mw']:>9,.0f}/MW")
+    print(f"+ regulation (full stack)  : AUD {full['per_mw']:>9,.0f}/MW")
+    print(f"Without Very Fast (R1/L1)  : AUD {no_vf['per_mw']:>9,.0f}/MW")
+    vf_uplift = (full['per_mw'] - no_vf['per_mw']) / no_vf['per_mw'] * 100
+    print(f"Very Fast (R1/L1) uplift   : +{vf_uplift:.1f}%")
+    print("-" * 66)
+    print(f"CIS cap-and-floor (floor {c['revenue_floor_per_mw_yr']/1e3:.0f}k / ceiling {c['revenue_ceiling_per_mw_yr']/1e3:.0f}k per MW):")
+    print(f"   merchant   : AUD {merchant_pmw:,.0f}/MW")
+    print(f"   contracted : AUD {contracted_pmw:,.0f}/MW  ({status})")
+    print("=" * 66)
+    print("Benchmark: NEM BESS net revenue 2025 ranged ~AU$85k-215k/MW/yr (Modo Energy).")

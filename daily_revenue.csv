@@ -1,0 +1,86 @@
+"""
+fetch_aemo_data.py
+==================
+Fetch real NEM energy + full FCAS price data from AEMO's NEMWeb MMSDM archive.
+Run on a networked machine (needs access to nemweb.com.au).
+
+The DISPATCHPRICE table contains energy (RRP) plus all FCAS price columns:
+  RRP, RAISE6SECRRP, RAISE60SECRRP, RAISE5MINRRP, RAISE1SECRRP,
+  LOWER6SECRRP, LOWER60SECRRP, LOWER5MINRRP, LOWER1SECRRP,
+  RAISEREGRRP, LOWERREGRRP
+(RAISE1SEC / LOWER1SEC are the Very Fast services, live since Oct 2023.)
+
+This script maps AEMO's column names to the model's short names and writes
+data/nem_prices.csv. The model reads it automatically if present.
+
+Usage:
+    python model/fetch_aemo_data.py --region QLD1 --year 2024 --month 7
+
+NEMWeb: https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/
+Regions: NSW1, QLD1, SA1, TAS1, VIC1.
+"""
+
+import argparse, io, os, zipfile
+import pandas as pd
+import requests
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+MMSDM_BASE = (
+    "https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/"
+    "{year}/MMSDM_{year}_{month:02d}/MMSDM_Historical_Data_SQLLoader/"
+    "DATA/PUBLIC_DVD_DISPATCHPRICE_{year}{month:02d}010000.zip"
+)
+
+# AEMO column -> model short name
+COLMAP = {
+    "SETTLEMENTDATE": "SETTLEMENTDATE", "REGIONID": "REGIONID", "RRP": "RRP",
+    "RAISE6SECRRP": "R6SEC", "RAISE60SECRRP": "R60SEC", "RAISE5MINRRP": "R5MIN", "RAISE1SECRRP": "R1SEC",
+    "LOWER6SECRRP": "L6SEC", "LOWER60SECRRP": "L60SEC", "LOWER5MINRRP": "L5MIN", "LOWER1SECRRP": "L1SEC",
+    "RAISEREGRRP": "RAISEREG", "LOWERREGRRP": "LOWERREG",
+}
+
+
+def download_month(year, month):
+    url = MMSDM_BASE.format(year=year, month=month)
+    print(f"Downloading {url}")
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=180)
+    r.raise_for_status()
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    raw = zf.read(zf.namelist()[0]).decode("utf-8", errors="ignore").splitlines()
+    header, rows = None, []
+    for line in raw:
+        p = line.split(",")
+        if p[0] == "I" and "DISPATCHPRICE" in p[2].upper():
+            header = p
+        elif p[0] == "D" and "DISPATCHPRICE" in p[2].upper():
+            rows.append(p)
+    if header is None:
+        raise ValueError("DISPATCHPRICE header not found.")
+    df = pd.DataFrame(rows, columns=header)
+    avail = {a: m for a, m in COLMAP.items() if a in df.columns}
+    df = df[list(avail.keys())].rename(columns=avail)
+    df["SETTLEMENTDATE"] = pd.to_datetime(df["SETTLEMENTDATE"])
+    for c in df.columns:
+        if c not in ("SETTLEMENTDATE", "REGIONID"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--region", default="QLD1")
+    ap.add_argument("--year", type=int, default=2024)
+    ap.add_argument("--month", type=int, default=7)
+    args = ap.parse_args()
+    df = download_month(args.year, args.month)
+    df = df[df["REGIONID"] == args.region].sort_values("SETTLEMENTDATE")
+    out = os.path.join(DATA_DIR, "nem_prices.csv")
+    df.to_csv(out, index=False)
+    print(f"Saved {len(df):,} intervals for {args.region} -> {out}")
+    print(f"Columns: {list(df.columns)}")
+
+
+if __name__ == "__main__":
+    main()

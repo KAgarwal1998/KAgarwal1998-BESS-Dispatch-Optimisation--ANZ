@@ -1,0 +1,128 @@
+"""charts.py — visuals for the ANZ multi-market BESS dispatch model."""
+import os, sys, json
+sys.path.insert(0, os.path.dirname(__file__))
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from optimiser import Battery, RAISE, LOWER
+from run import load_prices, run_dispatch, apply_cis
+
+OUT = os.path.join(os.path.dirname(__file__), "..", "outputs")
+os.makedirs(OUT, exist_ok=True)
+plt.rcParams.update({"figure.facecolor": "white", "axes.grid": True, "grid.alpha": 0.3, "font.size": 10})
+BLUE, GREEN, GOLD, ORANGE, NAVY, PURPLE = "#2c7fb8", "#41ab5d", "#fec44f", "#d95f0e", "#253494", "#8856a7"
+
+
+def market_stack(full, batt):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    parts = [full["annual_energy"], full["annual_contingency"], full["annual_regulation"]]
+    parts = [p / batt.power_mw / 1e3 for p in parts]
+    labels = ["Energy\narbitrage", "Contingency\nFCAS", "Regulation\nFCAS"]
+    bars = ax.bar(labels, parts, color=[BLUE, GREEN, PURPLE], alpha=0.85)
+    for b, v in zip(bars, parts):
+        ax.text(b.get_x()+b.get_width()/2, v, f"${v:.0f}k", ha="center", va="bottom", fontweight="bold")
+    ax.set_ylabel("Revenue (AUD k / MW / yr)")
+    ax.set_title("Revenue by market — full stack co-optimisation", fontweight="bold")
+    fig.tight_layout(); fig.savefig(f"{OUT}/market_stack.png", dpi=130); plt.close(fig)
+    print("market_stack.png")
+
+
+def stacking_value(df, batt):
+    energy = run_dispatch(df, batt, False, False, True)["per_mw"] / 1e3
+    cont = run_dispatch(df, batt, True, False, True)["per_mw"] / 1e3
+    full = run_dispatch(df, batt, True, True, True)["per_mw"] / 1e3
+    fig, ax = plt.subplots(figsize=(8, 5))
+    stages = ["Energy\nonly", "+ Contingency\nFCAS", "+ Regulation\n(full stack)"]
+    vals = [energy, cont, full]
+    bars = ax.bar(stages, vals, color=[BLUE, GREEN, PURPLE], alpha=0.85)
+    for b, v in zip(bars, vals):
+        ax.text(b.get_x()+b.get_width()/2, v, f"${v:.0f}k", ha="center", va="bottom", fontweight="bold")
+    ax.axhline(85, color=ORANGE, ls="--", lw=1.5, label="2025 NEM low (~$85k)")
+    ax.axhline(215, color="red", ls="--", lw=1.5, label="2025 NEM high (~$215k)")
+    ax.set_ylabel("Revenue (AUD k / MW / yr)")
+    ax.set_title("Value of revenue stacking (vs 2025 NEM benchmark band)", fontweight="bold")
+    ax.legend(fontsize=8)
+    fig.tight_layout(); fig.savefig(f"{OUT}/stacking_value.png", dpi=130); plt.close(fig)
+    print("stacking_value.png")
+
+
+def dispatch_day(full, day_index=0):
+    df = full["df"].copy()
+    df["date"] = df["SETTLEMENTDATE"].dt.date
+    days = sorted(df["date"].unique())
+    d = df[df["date"] == days[day_index]]
+    h = d["SETTLEMENTDATE"].dt.hour + d["SETTLEMENTDATE"].dt.minute / 60
+    fig, ax1 = plt.subplots(figsize=(11, 5.5))
+    ax1.plot(h, d["RRP"], color=NAVY, lw=1.5, label="Energy price (RRP)")
+    ax1.set_xlabel("Hour"); ax1.set_ylabel("Price (AUD/MWh)"); ax1.set_xlim(0, 24)
+    ax2 = ax1.twinx()
+    ax2.fill_between(h, 0, d["chg"], color=BLUE, alpha=0.5, label="Charge (MW)")
+    ax2.fill_between(h, 0, -d["dis"], color=GREEN, alpha=0.6, label="Discharge (MW)")
+    ax2.set_ylabel("Power (MW)  +chg / −dis"); ax2.grid(False)
+    l1, lab1 = ax1.get_legend_handles_labels(); l2, lab2 = ax2.get_legend_handles_labels()
+    ax1.legend(l1 + l2, lab1 + lab2, loc="upper left", fontsize=8)
+    ax1.set_title("Energy dispatch vs price (battery charges midday, discharges evening peak)", fontweight="bold")
+    fig.tight_layout(); fig.savefig(f"{OUT}/dispatch_day.png", dpi=130); plt.close(fig)
+    print("dispatch_day.png")
+
+
+def cis_chart(df, batt, cfg):
+    """Show CIS cap-and-floor effect across a range of merchant outcomes."""
+    c = cfg["contract"]
+    merchant = np.linspace(50e3, 280e3, 60)
+    contracted = [apply_cis(m, c["revenue_floor_per_mw_yr"], c["revenue_ceiling_per_mw_yr"], c["ceiling_clawback_frac"])[0] for m in merchant]
+    fig, ax = plt.subplots(figsize=(8.5, 5))
+    ax.plot(merchant/1e3, np.array(contracted)/1e3, color=PURPLE, lw=2.5, label="Contracted (post-CIS)")
+    ax.plot(merchant/1e3, merchant/1e3, color="grey", ls="--", lw=1, label="Merchant (no contract)")
+    ax.axvline(c["revenue_floor_per_mw_yr"]/1e3, color=GREEN, ls=":", label=f"Floor ${c['revenue_floor_per_mw_yr']/1e3:.0f}k")
+    ax.axvline(c["revenue_ceiling_per_mw_yr"]/1e3, color=ORANGE, ls=":", label=f"Ceiling ${c['revenue_ceiling_per_mw_yr']/1e3:.0f}k")
+    ax.set_xlabel("Merchant revenue (AUD k/MW/yr)"); ax.set_ylabel("Contracted revenue (AUD k/MW/yr)")
+    ax.set_title("CIS cap-and-floor: downside protected, upside shared", fontweight="bold")
+    ax.legend(fontsize=8)
+    fig.tight_layout(); fig.savefig(f"{OUT}/cis_cap_floor.png", dpi=130); plt.close(fig)
+    print("cis_cap_floor.png")
+
+
+def duration_sweep(df, b_cfg, cfg):
+    durations = [1, 2, 3, 4]
+    revs = []
+    for dur in durations:
+        bb = Battery(power_mw=b_cfg["power_mw"], duration_h=dur, rte=b_cfg["rte"],
+                     cycle_cost_per_mwh=b_cfg["cycle_cost_per_mwh"],
+                     soc_min_frac=b_cfg["soc_min_frac"], soc_max_frac=b_cfg["soc_max_frac"],
+                     reg_utilisation=cfg["fcas"]["regulation_utilisation"])
+        revs.append(run_dispatch(df, bb, True, True, True)["per_mw"] / 1e3)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(durations, revs, marker="o", color=BLUE, lw=2)
+    for d, v in zip(durations, revs):
+        ax.text(d, v, f" ${v:.0f}k", va="bottom", fontsize=9)
+    ax.set_xlabel("Storage duration (h)"); ax.set_ylabel("Revenue (AUD k/MW/yr)")
+    ax.set_title("Revenue vs duration (declining marginal value)", fontweight="bold")
+    ax.set_xticks(durations)
+    fig.tight_layout(); fig.savefig(f"{OUT}/duration_sweep.png", dpi=130); plt.close(fig)
+    print("duration_sweep.png")
+
+
+if __name__ == "__main__":
+    cfg = json.load(open(os.path.join(os.path.dirname(__file__), "..", "inputs", "base.json")))
+    b = cfg["battery"]
+    batt = Battery(power_mw=b["power_mw"], duration_h=b["duration_h"], rte=b["rte"],
+                   cycle_cost_per_mwh=b["cycle_cost_per_mwh"], soc_min_frac=b["soc_min_frac"],
+                   soc_max_frac=b["soc_max_frac"], reg_utilisation=cfg["fcas"]["regulation_utilisation"])
+    df = load_prices()
+    full = run_dispatch(df, batt, True, True, True)
+    market_stack(full, batt)
+    stacking_value(df, batt)
+    dispatch_day(full)
+    cis_chart(df, batt, cfg)
+    duration_sweep(df, b, cfg)
+    # export
+    if "df" in full:
+        exp = full["df"][["SETTLEMENTDATE", "REGIONID", "RRP", "chg", "dis"]].copy()
+        exp["net_mw"] = exp["dis"] - exp["chg"]
+        exp.to_csv(f"{OUT}/dispatch_for_powerbi.csv", index=False)
+    full["daily"].to_csv(f"{OUT}/daily_revenue.csv", index=False)
+    print("CSVs exported")
